@@ -10,7 +10,7 @@ class DatasetFromHdf5(data.Dataset):
 
         self.GT = dataset.get("GT")
         # self.UP = dataset.get("HSI_up")
-        self.LRHSI = dataset.get("LRHSI")
+        self.LRHSI = dataset.get("HSI_up")
         self.RGB = dataset.get("RGB")
 
 
