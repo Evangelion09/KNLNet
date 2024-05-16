@@ -79,7 +79,7 @@ def train(training_data_loader, validate_data_loader,start_epoch=0):
 
             optimizer.zero_grad()  # fixed
 
-            output_HRHSI,UP_LRHSI,Highpass = model(LRHSI,HRMSI)
+            output_HRHSI = model(LRHSI,HRMSI)
             time_e = time.time()
             Pixelwise_Loss =PLoss(output_HRHSI, GT)
 
@@ -110,7 +110,7 @@ def train(training_data_loader, validate_data_loader,start_epoch=0):
             with torch.no_grad():
                 for iteration, batch in enumerate(validate_data_loader, 1):
                     GT,  LRHSI, HRMSI = batch[0].cuda(), batch[1].cuda(), batch[2].cuda()
-                    output_HRHSI,UP_LRHSI,Highpass = model(
+                    output_HRHSI = model(
                         LRHSI, HRMSI)
                     time_e = time.time()
                     Pixelwise_Loss = PLoss(output_HRHSI, GT)
