@@ -1,24 +1,19 @@
 import torch
 import torch.nn as nn
-import numpy as np
-import math
-import torch.nn.init as int
-# from torchstat import stat
-from torch.nn.parameter import Parameter
 import torch.nn.functional as F
-# #HYPER PARAMS(Pre-Defined) #
-# lr = 0.00001
 import functools
 
 class ChannelAttention(nn.Module):
-    def __init__(self, in_planes=64, ratio=16):
+    def __init__(self, in_channels=64, reduction_ratio=16):
         super(ChannelAttention, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
 
-        self.fc = nn.Sequential(nn.Conv2d(in_planes, in_planes // 8, 1, bias=False),
-                                nn.ReLU(),
-                                nn.Conv2d(in_planes // 8, in_planes, 1, bias=False))
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction_ratio, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(in_channels // reduction_ratio, in_channels, 1, bias=False)
+        )
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
@@ -27,251 +22,168 @@ class ChannelAttention(nn.Module):
         out = avg_out + max_out
         return self.sigmoid(out)
 
-
 class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super(SpatialAttention, self).__init__()
-
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
+        x = self.conv(x)
         return self.sigmoid(x)
 
-
-
-class CALayer(nn.Module):
-    def __init__(self, channel, reduction=8):
-        super(CALayer, self).__init__()
-        # global average pooling: feature --> point
+class ChannelAttentionLayer(nn.Module):
+    def __init__(self, channels, reduction=8):
+        super(ChannelAttentionLayer, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        # feature channel downscale and upscale --> channel weight
-        self.conv_du = nn.Sequential(
-            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=True),
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, padding=0, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=True),
+            nn.Conv2d(channels // reduction, channels, 1, padding=0, bias=True),
             nn.Sigmoid()
         )
 
     def forward(self, x):
         y = self.avg_pool(x)
-        y = self.conv_du(y)
+        y = self.conv(y)
         return x * y
 
-
-
-
-
-class _routing(nn.Module):
-
+class RoutingLayer(nn.Module):
     def __init__(self, in_channels, num_experts):
-        super(_routing, self).__init__()
-
+        super(RoutingLayer, self).__init__()
         self.fc = nn.Linear(in_channels, num_experts)
 
     def forward(self, x):
-        x = torch.flatten(x)
+        x = torch.flatten(x, start_dim=3)
         x = self.fc(x)
         return F.sigmoid(x)
 
-
-class KNLConv(nn.Module):
-    def __init__(self,in_channel=64,kernel_size=3,red_ratio=2):
-        super(KNLConv, self).__init__()
-        self.in_channels=in_channel
-        self.outChannel = in_channel
+class KernelNonLocalConv(nn.Module):
+    def __init__(self, in_channels=64, kernel_size=3, reduction_ratio=2):
+        super(KernelNonLocalConv, self).__init__()
+        self.in_channels = in_channels
         self.kernel_size = kernel_size
-        self.red_ratio=red_ratio
-        self.inter_channels=self.in_channels
+        self.inter_channels = self.in_channels
 
-        self.span = nn.Conv2d(self.in_channels, self.kernel_size**2, kernel_size=3,padding=1)
+        self.span_conv = nn.Conv2d(self.in_channels, self.kernel_size**2, kernel_size=3, padding=1)
+        self.channel_conv = nn.Conv2d(self.in_channels, self.in_channels, kernel_size=3, stride=1, padding=1)
 
-        self.chConv = nn.Conv2d(self.in_channels, self.in_channels, kernel_size=3, stride=1,padding=1)
+        self.down_conv = nn.Conv2d(self.kernel_size**2, self.in_channels, kernel_size=1, padding=0)
+        self.down_conv1 = nn.Conv2d(self.in_channels, self.in_channels, kernel_size=3, stride=2, padding=1)
+        self.down_conv2 = nn.Conv2d(self.in_channels, self.in_channels, kernel_size=3, stride=2, padding=1)
 
-
-        nlchan = self.in_channels * (self.kernel_size ** 2)
-        # non-local
-        self.dimension=2
-
-        conv_nd = nn.Conv2d
-        max_pool_layer = nn.MaxPool2d(kernel_size=(2, 2))
-        bn = nn.BatchNorm2d
-
-        self.conv_num = 8
-
-        self.down = conv_nd(in_channels = (self.kernel_size ** 2),
-                             out_channels=self.in_channels,
-                             stride=1, kernel_size=1, padding=0)
-        self.down1 = conv_nd(in_channels=self.in_channels,
-                             out_channels=self.in_channels,
-                             stride=2, kernel_size=3, padding=1)
-
-        self.down2 = conv_nd(in_channels=self.in_channels,
-                             out_channels=self.in_channels,
-                             stride=2, kernel_size=3, padding=1)
-
-        self.up1=nn.Sequential(
+        self.up_conv1 = nn.Sequential(
             nn.Upsample(scale_factor=2),
-            nn.Conv2d(in_channels=self.in_channels,
-                          out_channels=self.in_channels,
-                          kernel_size=3, stride=1, padding=1))
-        self.up2=nn.Sequential(
+            nn.Conv2d(self.in_channels, self.in_channels, kernel_size=3, stride=1, padding=1)
+        )
+        self.up_conv2 = nn.Sequential(
             nn.Upsample(scale_factor=2),
-            nn.Conv2d(in_channels=self.in_channels,
-                          out_channels=self.in_channels,
-                          kernel_size=3, stride=1, padding=1))
-        self.up=nn.Conv2d(in_channels=self.in_channels,
-                  out_channels=(self.kernel_size ** 2),
-                  kernel_size=1, stride=1, padding=0)
+            nn.Conv2d(self.in_channels, self.in_channels, kernel_size=3, stride=1, padding=1)
+        )
+        self.up_conv = nn.Conv2d(self.in_channels, self.kernel_size**2, kernel_size=1, padding=0)
 
-        self.g = conv_nd(in_channels=self.in_channels ,
-                         out_channels=self.inter_channels, kernel_size=1)
+        self.g_conv = nn.Conv2d(self.in_channels, self.inter_channels, kernel_size=1)
+        self.W_z_conv = nn.Conv2d(self.inter_channels, self.in_channels, kernel_size=1)
 
-        self.W_z = conv_nd(in_channels=self.inter_channels,
-                           out_channels=self.in_channels, kernel_size=1)
+        nn.init.constant_(self.W_z_conv.weight, 0)
+        nn.init.constant_(self.W_z_conv.bias, 0)
 
-        nn.init.constant_(self.W_z.weight, 0)
-        nn.init.constant_(self.W_z.bias, 0)
+        self.theta_conv = nn.Conv2d(self.in_channels, self.inter_channels, kernel_size=1)
+        self.phi_conv = nn.Conv2d(self.in_channels, self.inter_channels, kernel_size=1)
 
-        self.theta = conv_nd(in_channels=self.in_channels,
-                             out_channels=self.inter_channels, kernel_size=1)
+        self.unfold = nn.Unfold(kernel_size=self.kernel_size, dilation=1, padding=1, stride=1)
 
-        self.phi = conv_nd(in_channels=self.in_channels,
-                           out_channels=self.inter_channels, kernel_size=1)
+        self.conv_weight = nn.Conv2d(self.in_channels, out_channels=8, kernel_size=3, stride=1, padding=1)
+        self.conv1 = nn.Conv2d(self.in_channels, self.in_channels//2, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(self.in_channels//2, self.in_channels, kernel_size=3, stride=1, padding=1)
+        self.weight = nn.Parameter(torch.Tensor(8, self.in_channels, self.in_channels, 1, 1))
 
-        # self.relu = nn.ReLU(inplace=True)
-        self.unfold1 = nn.Unfold(kernel_size=self.kernel_size, dilation=1, padding=1, stride=1)
+        self.avg_pooling = functools.partial(F.adaptive_avg_pool2d, output_size=(1, 1))
+        self.routing_fn = RoutingLayer(self.in_channels, 8)
 
+    def forward(self, x):
+        batch_size, xC, xH, xW = x.shape
 
+        span = self.span_conv(x)
+        b, c, h, w = span.shape
+        channel_feature = self.channel_conv(x).view(b, self.in_channels, 1, h, w)
+        span = span.view(b, self.kernel_size**2, h, w).unsqueeze(1)
 
-        self.conv_weight =  nn.Conv2d(in_channels=self.in_channels, out_channels=self.conv_num, kernel_size=3, stride=1, padding=1)
+        kernel = self.down_conv(span)
+        kernel = self.down_conv1(kernel)
+        kernel = self.down_conv2(kernel)
 
-        self.weight = Parameter(torch.Tensor(self.conv_num, self.in_channels, self.in_channels, 1, 1))
+        g = self.g_conv(kernel).view(batch_size, self.inter_channels, -1)
+        g = g.permute(0, 2, 1)
+        theta = self.theta_conv(kernel).view(batch_size, self.inter_channels, -1)
+        phi = self.phi_conv(kernel).view(batch_size, self.inter_channels, -1)
+        theta = theta.permute(0, 2, 1)
+        attention_map = torch.matmul(theta, phi)
+        attention_map = attention_map / attention_map.size(-1)
+        y = torch.matmul(attention_map, g)
+        y = y.permute(0, 2, 1).contiguous().view(batch_size, self.inter_channels, *kernel.size()[2:])
+        y = self.W_z_conv(y)
+        kernel = y + kernel
+        kernel = self.up_conv1(kernel)
+        kernel = self.up_conv2(kernel)
+        kernel = self.up_conv(kernel).view(b, self.kernel_size**2, h, w).unsqueeze(1)
+        kernel = kernel * channel_feature
+        kernel = kernel.view([batch_size, xC, self.kernel_size**2, xH, xW])
+        kernel = kernel.view(batch_size, xC * self.kernel_size**2, xH, xW)
+        kernel = kernel.view([batch_size, xC, -1, xH, xW])
 
-        self._avg_pooling = functools.partial(F.adaptive_avg_pool2d, output_size=(1, 1))
-        self._routing_fn = _routing(self.in_channels, self.conv_num)
-
-
-    def forward(self, feature):
-
-        BS, xC, xH, xW = feature.size()
-
-        x1=self.span(feature)
-        b, c, h, w = x1.shape
-        ch_fea=self.chConv(feature).view(b, self.in_channels, 1, h, w)
-        x1 = x1.view(b, self.kernel_size ** 2, h, w).unsqueeze(1)
-
-        ker1 = x1.reshape(BS, (self.kernel_size ** 2), xH, xW)
-
-        # print(ker1.shape)
-        fea_ker = self.down(ker1)
-        fea_ker=self.down1(fea_ker )
-        fea_ker=self.down2(fea_ker)
-        # print(fea_ker.shape)
-        g_x = self.g(fea_ker).view(BS, self.inter_channels, -1)
-        # print(g_x.shape)
-        g_x = g_x.permute(0, 2, 1)
-        theta_x = self.theta(fea_ker).view(BS, self.inter_channels, -1)
-        phi_x = self.phi(fea_ker).view(BS, self.inter_channels, -1)
-        theta_x = theta_x.permute(0, 2, 1)
-        f = torch.matmul(theta_x, phi_x)
-        N1 = f.size(-1)  # number of position in x
-        f = f / N1
-        y = torch.matmul(f, g_x)
-        y = y.permute(0, 2, 1).contiguous()
-        y = y.view(BS, self.inter_channels, * fea_ker.size()[2:])
-        y = self.W_z(y)
-        kernel = y + fea_ker
-        kernel=self.up1(kernel)
-        kernel=self.up2(kernel)
-        kernel = self.up(kernel).view(b, self.kernel_size ** 2, h, w).unsqueeze(1)
-        kernel = kernel * ch_fea
-        kernel = kernel.reshape([BS, xC, (self.kernel_size ** 2), xH, xW])
-        kernel = kernel.reshape(BS, xC * (self.kernel_size ** 2), xH, xW)
-        kernel=kernel.reshape([BS,xC, -1, xH, xW])
-
-
-        unfold_feature = self.unfold1(feature).reshape([BS,xC, -1, xH, xW])
+        unfold_feature = self.unfold(x).view([batch_size, xC, -1, xH, xW])
         x = (unfold_feature * kernel).sum(2)
 
-        x1 = x.unsqueeze(0)
-        pooled_inputs = self._avg_pooling(x1)
-        routing_weights = self._routing_fn(pooled_inputs)
-
-        kernels = torch.sum(routing_weights[:, None, None, None, None] * self.weight, 0)
-
-        x = F.conv2d(x, kernels)
-
-
-        return x
-
+        feat = x
+        x = self.conv1(x)
+        routing_weights = self.routing_fn(x.permute(0, 2, 3, 1))
+        weight_reshaped = self.weight.view(1, 1, 1, 8, -1)
+        result = routing_weights.view(batch_size, xH, xW, 8, 1) * weight_reshaped
+        result_summed = result.sum(dim=3)
+        conv_kernel = result_summed.view(batch_size, xH, xW, self.in_channels, self.in_channels).permute(0, 3, 4, 1, 2)
+        ufx = x.view([batch_size, xC, -1, xH, xW])
+        output = (ufx * conv_kernel).sum(2)
+        output = self.conv2(output)
+        
+        return output + feat
 
 class KNLNet(nn.Module):
     def __init__(self):
         super(KNLNet, self).__init__()
-        self.inC = 31 + 3
-        self.outC = 31
+        self.input_channels = 34
+        self.output_channels = 31
 
-        self.kernel_size = 3
-        self.block_number = 3
-        self.innerC = 64
-        self.inConv = nn.Conv2d(in_channels=self.inC, out_channels=self.innerC, kernel_size=3, stride=1, padding=1, bias=True)
+        self.inner_channels = 64
+        self.initial_conv = nn.Conv2d(self.input_channels, self.inner_channels, kernel_size=3, stride=1, padding=1)
 
-        layers = []
-        for i in range(self.block_number):
-            layers.append(ResBlock())
-        self.adConvList=nn.Sequential(*layers)
-        self.relu=nn.ReLU()
-        self.outConv = nn.Conv2d(in_channels=self.innerC, out_channels=self.outC, kernel_size=3, stride=1, padding=1,
-                                bias=True)
+        self.res_blocks = nn.Sequential(*[ResidualBlock() for _ in range(3)])
+        self.relu = nn.ReLU()
+        self.final_conv = nn.Conv2d(self.inner_channels, self.output_channels, kernel_size=3, stride=1, padding=1)
 
-    def forward(self, x,y):
-        BS, xC, xH, xW = x.size()
-        input=torch.cat((x,y),1)
-        feature = self.inConv(input)
-        resfeature=self.adConvList(feature)
-        # feature=feature+resfeature
-        feature = resfeature
-        output=self.outConv(feature) + x
+    def forward(self, x, y):
+        input = torch.cat((x, y), 1)
+        feature = self.initial_conv(input)
+        res_feature = self.res_blocks(feature)
+        output = self.final_conv(res_feature) + x
         return output
 
-
-
-class ResNetBlock(nn.Module):
+class ResidualBlock(nn.Module):
     def __init__(self):
-        super(ResNetBlock, self).__init__()
+        super(ResidualBlock, self).__init__()
         self.kernel_size = 3
-        self.innerC = 64
-        m = []
-        m.append(nn.Conv2d(in_channels=self.innerC, out_channels=self.innerC, kernel_size=3, stride=1, padding=1,
-                                bias=True))
-        m.append(nn.ReLU())
-        m.append(nn.Conv2d(in_channels=self.innerC, out_channels=self.innerC, kernel_size=3, stride=1, padding=1,
-                                        bias=True))
-        self.body = nn.Sequential(*m)
-        # init_weights(self.body)
+        self.inner_channels = 64
+        self.layers = nn.Sequential(
+            nn.Conv2d(self.inner_channels, self.inner_channels, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(self.inner_channels, self.inner_channels, kernel_size=3, stride=1, padding=1)
+        )
 
     def forward(self, x):
-        res = self.body(x)
+        res = self.layers(x)
         res += x
         return res
-class ResBlock(nn.Module):
-    def __init__(self):
-        super(ResBlock, self).__init__()
-        self.kernel_size = 3
-        self.innerC = 64
-
-        m.append(KNLConv(in_channel=self.innerC,kernel_size=self.kernel_size))
-        m.append(nn.ReLU())
-        m.append(KNLConv(in_channel=self.innerC, kernel_size=self.kernel_size))
-        self.body = nn.Sequential(*m)
-
-    def forward(self, x):
-        res = self.body(x)
-        res += x
-        return res
-
+    
