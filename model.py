@@ -177,9 +177,9 @@ class ResidualBlock(nn.Module):
         self.kernel_size = 3
         self.inner_channels = 64
         self.layers = nn.Sequential(
-            nn.Conv2d(self.inner_channels, self.inner_channels, kernel_size=3, stride=1, padding=1),
+            KernelNonLocalConv(self.inner_channels),
             nn.ReLU(),
-            nn.Conv2d(self.inner_channels, self.inner_channels, kernel_size=3, stride=1, padding=1)
+            KernelNonLocalConv(self.inner_channels)
         )
 
     def forward(self, x):
